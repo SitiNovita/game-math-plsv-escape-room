@@ -2766,6 +2766,36 @@ const SESSION_KEY='plsvSessions';
 const ACTIVE_SESSION_KEY='plsvActiveSessionId';
 const LEGACY_RANKING_KEY='plsvRanking';
 
+const PLSV_CLOUD_URL = 'https://script.google.com/macros/s/AKfycbziAn7P0E0l4s1Knchu4Mz0uB5hFt7kibiggxxo5tIpsutKwl3ggSi_FI2X9m2TRKeCVQ/exec';
+let cloudRowsCache = [];
+function cloudGetRows(){
+  return new Promise((resolve,reject)=>{
+    const cb='plsvCloudCb_'+Date.now()+'_'+Math.random().toString(36).slice(2,7);
+    const script=document.createElement('script');
+    const timer=setTimeout(()=>{cleanup();reject(new Error('Waktu tunggu data pusat habis.'));},12000);
+    function cleanup(){clearTimeout(timer);try{delete window[cb];}catch(e){window[cb]=undefined;}script.remove();}
+    window[cb]=(data)=>{cleanup();resolve(Array.isArray(data)?data:[]);};
+    script.onerror=()=>{cleanup();reject(new Error('Data pusat tidak dapat dimuat.'));};
+    script.src=PLSV_CLOUD_URL+'?callback='+encodeURIComponent(cb)+'&t='+Date.now();
+    document.head.appendChild(script);
+  });
+}
+function mapCloudRow(r){return {id:String(r.ID||r.id||''),name:String(r.Nama||r.name||''),kelas:String(r.Kelas||r.kelas||''),score:Number(r.Skor??r.score)||0,time:Number(r['Waktu Pengerjaan']??r.time)||0,date:String(r.Tanggal||r.date||''),correct:Number(r.correct)||0,wrong:Number(r.wrong)||0,email:'',nisn:'',role:'student',sessionId:'cloud-session',sessionName:'Data Bersama'};}
+async function refreshCloudRows(){
+  try{
+    const data=await cloudGetRows();
+    cloudRowsCache=data.map(mapCloudRow).filter(r=>r.id);
+    const local=readJSON('plsvRanking',[]);
+    const byId=new Map();
+    [...(Array.isArray(local)?local:[]),...cloudRowsCache].forEach(r=>byId.set(String(r.id),r));
+    localStorage.setItem('plsvRanking',JSON.stringify([...byId.values()]));
+    return cloudRowsCache;
+  }catch(err){console.warn('Sinkronisasi data pusat:',err);return null;}
+}
+function cloudPost(payload){
+  // text/plain menghindari preflight CORS; Apps Script tetap membaca isi JSON.
+  return fetch(PLSV_CLOUD_URL,{method:'POST',mode:'no-cors',headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify(payload)}).catch(err=>console.warn('Pengiriman hasil ke data pusat gagal:',err));
+}
 function readJSON(key,fallback){try{const v=JSON.parse(localStorage.getItem(key)||'');return v??fallback;}catch(e){return fallback;}}
 function nowISO(){return new Date().toISOString();}
 function sessionId(){return 'sess-'+Date.now()+'-'+Math.random().toString(36).slice(2,8);}
@@ -2871,7 +2901,8 @@ function editTeacherResult(id){
   if(!name.trim()||!email.trim()||!kelas.trim()){alert('Nama, email, dan kelas wajib diisi.');return;}
   all[idx]={...item,name:name.trim(),email:email.trim().toLowerCase(),nisn:nisn.trim(),kelas:kelas.trim(),score:Number(score)||0,correct:Number(correct)||0,wrong:Number(wrong)||0,time:Number(time)||0};
   all.sort((a,b)=>Number(b.score)-Number(a.score)||Number(a.time)-Number(b.time));setAllRanking(all);
-  alert('✅ Data leaderboard berhasil diperbarui.');loadObserverData();renderResultRanking();
+  if(String(item.id).startsWith('cloud-')||item.sessionId==='cloud-session'||cloudRowsCache.some(r=>String(r.id)===String(item.id))) cloudPost({action:'update',id:item.id,nama:name.trim(),kelas:kelas.trim(),skor:Number(score)||0,waktu:Number(time)||0});
+  alert('✅ Data leaderboard berhasil diperbarui di browser ini. Jika data berasal dari Google Sheets, pembaruan pusat dikirim juga.');loadObserverData();renderResultRanking();
 }
 function deleteTeacherResult(id){
   if(!observerUnlocked){alert('Akses Guru diperlukan.');return;}
@@ -2880,7 +2911,8 @@ function deleteTeacherResult(id){
 
 Data yang dihapus tidak dapat dipulihkan.`);if(!ok)return;
   setAllRanking(all.filter(r=>String(r.id)!==String(id)));
-  alert('✅ Data berhasil dihapus.');loadObserverData();renderResultRanking();
+  if(cloudRowsCache.some(r=>String(r.id)===String(id))) cloudPost({action:'delete',id:String(id)});
+  alert('✅ Data berhasil dihapus dari browser ini. Jika data berasal dari Google Sheets, penghapusan pusat dikirim juga.');loadObserverData();renderResultRanking();
 }
 function deleteAllTeacherData(){
   if(!observerUnlocked){alert('Akses Guru diperlukan.');return;}
@@ -2901,12 +2933,16 @@ function updateObserverStats(rows){
   set('statDone',done);set('statAverage',scores.length?avg:'0');set('statHighest',scores.length?highest:'0');set('statLowest',scores.length?lowest:'0');set('statNotDone',notDone===null?'—':notDone);
   const note=document.getElementById('statNotDoneNote');if(note)note.textContent=notDone===null?'atur target peserta':`${target} target − ${done} sudah mengerjakan`;
 }
-function loadObserverData(){
+async function loadObserverData(){
   if(!observerUnlocked)return;
+  await refreshCloudRows();
   const body=document.getElementById('observerRankBody');if(!body)return;
   ensureSessionStore();fillSessionFilter();
   const selected=getSessionById(observerSelectedSessionId)||getActiveSession();observerSelectedSessionId=selected?.id||getActiveSessionId();
-  const allRows=getAllRanking().filter(r=>String(r.sessionId)===String(observerSelectedSessionId)).map((r,i)=>({...r,id:r.id||`${r.email||r.name||'peserta'}-${i}`}));
+  const activeForCloud=getActiveSession();
+  const localRows=getAllRanking().map(r=>r.sessionId==='cloud-session'?{...r,sessionId:activeForCloud.id,sessionName:activeForCloud.name}:r);
+  setAllRanking(localRows);
+  const allRows=localRows.filter(r=>String(r.sessionId)===String(observerSelectedSessionId)).map((r,i)=>({...r,id:r.id||`${r.email||r.name||'peserta'}-${i}`}));
   allRows.sort((a,b)=>Number(b.score)-Number(a.score)||Number(a.time)-Number(b.time));
   observerRows=allRows;updateObserverStats(allRows);prepareClassFilters();renderTeacherTable();updateSessionHeader();
   const status=document.getElementById('observerStatus');
@@ -2981,7 +3017,7 @@ function saveRankingResult(time){
   const correct=answers.filter(a=>a&&a.correct).length;const now=new Date();
   const active=getActiveSession();
   const payload={id:`${String(playerEmail||playerName).toLowerCase()}-${now.getTime()}`,role:'student',name:playerName,email:playerEmail,nisn:playerNisn,kelas:playerClass,score,time,correct,wrong:10-correct,character:CHARACTER_DATA[selectedChar]?.name||selectedChar,date:now.toLocaleString('id-ID'),sessionId:active.id,sessionName:active.name};
-  const all=getAllRanking();all.push(payload);all.sort((a,b)=>Number(b.score)-Number(a.score)||Number(a.time)-Number(b.time));setAllRanking(all);observerRows=getRanking();return true;
+  const all=getAllRanking();all.push(payload);all.sort((a,b)=>Number(b.score)-Number(a.score)||Number(a.time)-Number(b.time));setAllRanking(all);observerRows=getRanking();cloudPost({action:'save',id:payload.id,nama:payload.name,kelas:payload.kelas,skor:payload.score,waktu:payload.time,tanggal:payload.date});return true;
 }
 
 function availableClasses(){return ['VIII A','VIII B','VIII C','VIII D','VIII E','VIII F','VIII G','VIII H','VIII I','VIII J'];}
@@ -2997,7 +3033,7 @@ function prepareClassFilters(){
 function setTeacherClassFilter(value){teacherClassFilter=availableClasses().includes(value)?value:'VIII A';localStorage.setItem('plsvTeacherClassFilter',teacherClassFilter);const note=document.getElementById('teacherClassNote');if(note)note.textContent='Leaderboard kelas '+teacherClassFilter;renderTeacherTable();}
 function setResultClassFilter(value){resultClassFilter=availableClasses().includes(value)?value:'VIII A';renderRankingTable('resultRankBody',resultClassFilter);}
 function setRankClassFilter(value){rankClassFilter=availableClasses().includes(value)?value:'VIII A';localStorage.setItem('plsvRankClassFilter',rankClassFilter);renderRankingTable('rankBody',rankClassFilter);}
-async function renderResultRanking(){prepareClassFilters();renderRankingTable('resultRankBody',resultClassFilter);}
+async function renderResultRanking(){await refreshCloudRows();const active=getActiveSession();const all=getAllRanking().map(r=>r.sessionId==='cloud-session'?{...r,sessionId:active.id,sessionName:active.name}:r);setAllRanking(all);prepareClassFilters();renderRankingTable('resultRankBody',resultClassFilter);}
 function renderRanking(){prepareClassFilters();renderRankingTable('rankBody',rankClassFilter);}
 function renderRankingTable(bodyId,classFilter){
   const data=getRanking().filter(r=>!classFilter||String(r.kelas||'').trim()===classFilter);
