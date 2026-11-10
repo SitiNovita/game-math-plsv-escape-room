@@ -2669,7 +2669,7 @@ input,select,textarea{border-radius:11px!important;border-color:#d9e2eb!importan
 </div>
 <div class="session-controls-right">
 <span class="session-view-note" id="sessionViewNote">Menampilkan sesi aktif.</span>
-<button class="btn light" onclick="loadObserverData()">🔄 Perbarui</button>
+<button class="btn light" onclick="refreshObserverData()">🔄 Perbarui</button>
 <button class="btn light" onclick="downloadObserverCSV()">⬇️ CSV</button>
 <button class="btn light" onclick="downloadObserverXLSX()">⬇️ Excel</button>
 <button class="btn light" type="button" onclick="plsvExportSafetyBackup()">🛡️ Backup Lengkap (JSON)</button>
@@ -3467,6 +3467,7 @@ function ensureSessionStore(){
     const active=sessions.find(s=>s.id===activeId);
     rows=rows.map(r=>r.sessionId===activeId?{...r,sessionName:r.sessionName||active?.name||'Sesi Aktif'}:r);
   }
+  rows=dedupeRankingRows(rows);
   localStorage.setItem(SESSION_KEY,JSON.stringify(sessions));
   localStorage.setItem(ACTIVE_SESSION_KEY,activeId);
   localStorage.setItem(LEGACY_RANKING_KEY,JSON.stringify(rows));
@@ -3572,6 +3573,21 @@ function deleteAllTeacherData(){
   localStorage.removeItem('plsv_student_reflections');
   ensureSessionStore();observerSelectedSessionId=getActiveSessionId();
   alert('✅ Semua data hasil permainan, arsip, dan refleksi siswa sudah dihapus. Sesi baru siap digunakan.');loadObserverData();
+}
+
+// Menghapus salinan identik akibat penggabungan cache lokal dan data Supabase.
+function dedupeRankingRows(rows){
+  const seen=new Set(),out=[];
+  (Array.isArray(rows)?rows:[]).forEach(r=>{
+    const key=JSON.stringify([
+      String(r.email||'').trim().toLowerCase(),String(r.name||r.studentName||'').trim().toLowerCase(),
+      String(r.kelas||r.class||'').trim().toUpperCase(),Number(r.score)||0,
+      Number(r.correct)||0,Number(r.wrong)||0,Number(r.time)||0,
+      String(r.date||r.createdAt||'').trim(),String(r.sessionId||''),String(r.sessionName||r.session||'')
+    ]);
+    if(!seen.has(key)){seen.add(key);out.push(r);}
+  });
+  return out;
 }
 
 function observerUniqueCount(rows){const seen=new Set();rows.forEach(r=>{const key=String(r.email||'').trim().toLowerCase()||(String(r.name||'').trim().toLowerCase()+'|'+String(r.kelas||'').trim().toLowerCase());if(key)seen.add(key);});return seen.size;}
@@ -6340,7 +6356,7 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
     for(const key of ["plsvRanking","plsv_student_reflections","plsv_game_ratings"]){
       const merged=[];
       rows.filter(r=>r.data_key===key && Array.isArray(r.payload)).forEach(r=>merged.push(...r.payload));
-      if(merged.length) originalSetItem.call(localStorage,key,JSON.stringify(merged));
+      if(merged.length) originalSetItem.call(localStorage,key,JSON.stringify(key==="plsvRanking"?dedupeRankingRows(merged):merged));
     }
     const sessions=[];
     rows.filter(r=>r.data_key==="plsvSessions" && Array.isArray(r.payload)).forEach(r=>sessions.push(...r.payload));
@@ -6352,6 +6368,33 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
     rows.filter(r=>r.data_key==="plsv_teacher_reflections" && Array.isArray(r.payload)).forEach(r=>teacherReflections.push(...r.payload));
     if(teacherReflections.length) originalSetItem.call(localStorage,"plsv_teacher_reflections",JSON.stringify(teacherReflections));
   }
+
+  async function fetchSharedLeaderboard(){
+    if(!sb) return [];
+    const {data,error}=await sb.rpc("get_public_plsv_leaderboard");
+    if(error) throw error;
+    const seen=new Set(),out=[];
+    (data||[]).forEach(r=>{
+      const item={id:r.id,name:r.name,email:r.email,kelas:r.kelas,score:r.score,correct:r.correct,wrong:r.wrong,time:r.time,date:r.date,sessionId:r.session_id,sessionName:r.session_name};
+      const key=JSON.stringify([String(item.email||'').toLowerCase(),String(item.name||'').toLowerCase(),String(item.kelas||'').toUpperCase(),Number(item.score)||0,Number(item.correct)||0,Number(item.wrong)||0,Number(item.time)||0,String(item.date||''),String(item.sessionId||''),String(item.sessionName||'')]);
+      if(!seen.has(key)){seen.add(key);out.push(item);}
+    });
+    return out;
+  }
+  window.__plsvFetchSharedLeaderboard=fetchSharedLeaderboard;
+  window.refreshObserverData=async function(){
+    const btn=[...document.querySelectorAll('button')].find(b=>b.getAttribute('onclick')==='refreshObserverData()');
+    if(btn){btn.disabled=true;btn.dataset.oldText=btn.textContent;btn.textContent='⏳ Memuat...';}
+    try{
+      if(!sb||!onlineUser) throw new Error('Akun belum terhubung ke Supabase.');
+      await syncQueue;
+      await hydrateTeacherOverview();
+      if(typeof loadObserverData==='function') loadObserverData();
+      const status=document.getElementById('observerStatus');
+      if(status) status.innerHTML='✅ Data terbaru berhasil dimuat dari Supabase.';
+    }catch(e){console.error('[Supabase] Refresh gagal',e);alert('Gagal memperbarui data online: '+(e.message||e));}
+    finally{if(btn){btn.disabled=false;btn.textContent=btn.dataset.oldText||'🔄 Perbarui';}}
+  };
 
   async function ensureProfile(user, role, name, kelas){
     const profile={
@@ -6466,6 +6509,20 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
       notify("Client Supabase siap.");
     }catch(e){console.error("[Supabase] Init gagal",e);}
   }
+  async function renderSharedStudentRanking(bodyId){
+    const body=document.getElementById(bodyId);if(!body)return;
+    const cls=(typeof studentOwnClass==='function'?studentOwnClass():'');
+    try{
+      const rows=await fetchSharedLeaderboard();
+      rows.sort((a,b)=>Number(b.score)-Number(a.score)||Number(a.time)-Number(b.time));
+      const visible=rows.filter(r=>!cls||String(r.kelas||'').trim().toUpperCase()===String(cls).trim().toUpperCase());
+      if(!visible.length){body.innerHTML='<tr><td colspan="4">Belum ada data online untuk kelas '+escapeHTML(cls||'ini')+'.</td></tr>';return;}
+      body.innerHTML=visible.map((r,i)=>`<tr><td>${i===0?'🥇':i===1?'🥈':i===2?'🥉':i+1}</td><td>${escapeHTML(r.name||'')}</td><td>${escapeHTML(r.kelas||'')}</td><td><b>${Number(r.score)||0}</b></td></tr>`).join('');
+    }catch(e){console.warn('[Supabase] Leaderboard bersama gagal dimuat',e);body.innerHTML='<tr><td colspan="4">Leaderboard online belum tersedia. Hubungi guru untuk memeriksa konfigurasi Supabase.</td></tr>';}
+  }
+  window.renderRanking=async function(){if(typeof prepareClassFilters==='function')prepareClassFilters();return renderSharedStudentRanking('rankBody');};
+  window.renderResultRanking=async function(){if(typeof prepareClassFilters==='function')prepareClassFilters();return renderSharedStudentRanking('resultRankBody');};
+
   if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",initSupabase);
   else initSupabase();
 })();
