@@ -3109,7 +3109,7 @@ input,select,textarea{border-radius:11px!important;border-color:#d9e2eb!importan
 <div class="leaderboard-content">
 <h2 class="center">🏆 Leaderboard</h2>
 
-<div class="leaderboard-filter"><span><b>Kelas kamu:</b> <span id="rankOwnClass">-</span></span></div>
+<div class="leaderboard-filter"><span><b>Kelas kamu:</b> <span id="rankOwnClass">-</span></span><button class="btn light" type="button" id="studentLeaderboardRefresh" onclick="refreshStudentLeaderboard()">🔄 Perbarui Peringkat</button></div>
 <p class="center leaderboard-access-note"></p>
 <table class="rank-table">
 <thead><tr><th>Peringkat</th><th>Nama</th><th>Kelas</th><th>Skor</th></tr></thead>
@@ -3577,15 +3577,22 @@ function deleteAllTeacherData(){
 
 // Menghapus salinan identik akibat penggabungan cache lokal dan data Supabase.
 function dedupeRankingRows(rows){
-  const seen=new Set(),out=[];
+  // Hasil yang tersalin ke beberapa akun dapat memiliki ID/sesi lokal berbeda.
+  // Karena itu, cek ID dan sidik-jari isi hasil (tanpa sessionId lokal).
+  const seenIds=new Set(),seenNatural=new Set(),out=[];
   (Array.isArray(rows)?rows:[]).forEach(r=>{
-    const key=JSON.stringify([
+    if(!r || typeof r!=='object') return;
+    const id=String(r.id||'').trim();
+    const natural=JSON.stringify([
       String(r.email||'').trim().toLowerCase(),String(r.name||r.studentName||'').trim().toLowerCase(),
       String(r.kelas||r.class||'').trim().toUpperCase(),Number(r.score)||0,
       Number(r.correct)||0,Number(r.wrong)||0,Number(r.time)||0,
-      String(r.date||r.createdAt||'').trim(),String(r.sessionId||''),String(r.sessionName||r.session||'')
+      String(r.date||r.createdAt||'').trim(),String(r.sessionName||r.session||'').trim().toLowerCase()
     ]);
-    if(!seen.has(key)){seen.add(key);out.push(r);}
+    if((id && seenIds.has(id)) || seenNatural.has(natural)) return;
+    if(id) seenIds.add(id);
+    seenNatural.add(natural);
+    out.push(r);
   });
   return out;
 }
@@ -6303,6 +6310,10 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
 
   async function writeOnline(key, payload){
     if(!sb || !onlineUser || !syncReady || !ONLINE_KEYS.includes(key)) return;
+    // Dashboard guru menggabungkan hasil seluruh siswa hanya untuk ditampilkan.
+    // Jangan mengunggah gabungan itu ke baris game_data milik akun guru,
+    // karena nanti hasil siswa akan terbaca lagi sebagai salinan kedua.
+    if(key==="plsvRanking" && isTeacher()) return;
     const {error}=await sb.from("game_data").upsert({
       user_id: onlineUser.id, data_key:key, payload:payload, updated_at:new Date().toISOString()
     },{onConflict:"user_id,data_key"});
@@ -6349,7 +6360,7 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
   async function hydrateTeacherOverview(){
     if(!isTeacher()) return;
     const {data,error}=await sb.from("game_data").select("user_id,data_key,payload");
-    if(error){console.warn("[Supabase] Data ringkasan guru belum dapat diambil",error);return;}
+    if(error){console.error("[Supabase] Data ringkasan guru gagal diambil",error);throw error;}
     const rows=data||[];
     // Gabungkan data dari akun siswa agar dashboard guru/rekap dapat melihat
     // leaderboard dan refleksi yang berasal dari banyak perangkat.
@@ -6371,29 +6382,46 @@ function deleteOneTeacherReflection(submittedAt,teacherName){
 
   async function fetchSharedLeaderboard(){
     if(!sb) return [];
+    // Jangan menunggu antrean sinkronisasi lokal: antrean yang macet tidak boleh
+    // menghalangi pembacaan leaderboard langsung dari Supabase.
     const {data,error}=await sb.rpc("get_public_plsv_leaderboard");
     if(error) throw error;
-    const seen=new Set(),out=[];
-    (data||[]).forEach(r=>{
-      const item={id:r.id,name:r.name,email:r.email,kelas:r.kelas,score:r.score,correct:r.correct,wrong:r.wrong,time:r.time,date:r.date,sessionId:r.session_id,sessionName:r.session_name};
-      const key=JSON.stringify([String(item.email||'').toLowerCase(),String(item.name||'').toLowerCase(),String(item.kelas||'').toUpperCase(),Number(item.score)||0,Number(item.correct)||0,Number(item.wrong)||0,Number(item.time)||0,String(item.date||''),String(item.sessionId||''),String(item.sessionName||'')]);
-      if(!seen.has(key)){seen.add(key);out.push(item);}
-    });
-    return out;
+    const out=(data||[]).map(r=>({id:r.id,name:r.name,email:r.email,kelas:r.kelas,score:r.score,correct:r.correct,wrong:r.wrong,time:r.time,date:r.date,sessionId:r.session_id,sessionName:r.session_name}));
+    return typeof dedupeRankingRows==='function'?dedupeRankingRows(out):out;
   }
   window.__plsvFetchSharedLeaderboard=fetchSharedLeaderboard;
   window.refreshObserverData=async function(){
     const btn=[...document.querySelectorAll('button')].find(b=>b.getAttribute('onclick')==='refreshObserverData()');
     if(btn){btn.disabled=true;btn.dataset.oldText=btn.textContent;btn.textContent='⏳ Memuat...';}
     try{
-      if(!sb||!onlineUser) throw new Error('Akun belum terhubung ke Supabase.');
-      await syncQueue;
+      if(!sb) throw new Error('Koneksi Supabase belum siap. Muat ulang halaman.');
+      if(!onlineUser){
+        const auth=await sb.auth.getSession();
+        onlineUser=auth.data?.session?.user||null;
+      }
+      if(!onlineUser) throw new Error('Sesi login tidak ditemukan. Silakan login kembali sebagai guru.');
+      // Ambil data langsung dari Supabase. Jangan menunggu antrean tulis lokal,
+      // karena antrean dapat tertahan oleh permintaan sebelumnya.
       await hydrateTeacherOverview();
       if(typeof loadObserverData==='function') loadObserverData();
       const status=document.getElementById('observerStatus');
-      if(status) status.innerHTML='✅ Data terbaru berhasil dimuat dari Supabase.';
+      if(status) status.innerHTML='✅ Leaderboard dan arsip berhasil diperbarui dari data Supabase terbaru.';
     }catch(e){console.error('[Supabase] Refresh gagal',e);alert('Gagal memperbarui data online: '+(e.message||e));}
     finally{if(btn){btn.disabled=false;btn.textContent=btn.dataset.oldText||'🔄 Perbarui';}}
+  };
+
+  window.refreshStudentLeaderboard=async function(){
+    const btn=document.getElementById('studentLeaderboardRefresh');
+    if(btn){btn.disabled=true;btn.dataset.oldText=btn.textContent;btn.textContent='⏳ Memuat...';}
+    try{
+      if(!sb) throw new Error('Koneksi Supabase belum siap. Coba muat ulang halaman.');
+      if(!onlineUser){const auth=await sb.auth.getSession();onlineUser=auth.data?.session?.user||null;}
+      if(!onlineUser) throw new Error('Sesi login tidak ditemukan. Silakan login kembali.');
+      // Refresh leaderboard membaca database secara langsung, tanpa menunggu
+      // antrean sinkronisasi tulis yang tidak terkait dengan proses pembacaan.
+      await renderSharedStudentRanking('rankBody');
+    }catch(e){console.error('[Supabase] Refresh leaderboard siswa gagal',e);alert('Leaderboard belum dapat diperbarui: '+(e.message||e));}
+    finally{if(btn){btn.disabled=false;btn.textContent=btn.dataset.oldText||'🔄 Perbarui Peringkat';}}
   };
 
   async function ensureProfile(user, role, name, kelas){
